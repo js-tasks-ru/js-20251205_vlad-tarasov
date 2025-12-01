@@ -5,186 +5,301 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { jsonrepair } from "jsonrepair";
 
-const MODULE_SECTION_PATTERN = /##\s+([0-9]{2}-[\w-]+)[\s\S]*?(?=\n##\s+[0-9]{2}-|$)/g;
-const CONTEXT_PADDING = 2; // lines of context around changed lines
-const MAX_LINES_PER_FILE = 400; // safety cap to avoid huge prompts
+// --- Configuration ---
+const CONFIG = {
+  MODEL_NAME: "gemini-2.5-flash",
+  MAX_LINES_PER_FILE: 400,
+  CONTEXT_PADDING: 2,
+  MODULE_REGEX: /^[0-9]{2}-[\w-]+$/,
+  MODULE_SECTION_PATTERN: /##\s+([0-9]{2}-[\w-]+)[\s\S]*?(?=\n##\s+[0-9]{2}-|$)/g,
+};
 
-async function getEventPayload() {
-  const eventPath = process.env.GITHUB_EVENT_PATH;
-  if (!eventPath) {
-    throw new Error("GITHUB_EVENT_PATH is not set; cannot read event payload");
-  }
-  const raw = await fs.readFile(eventPath, "utf8");
-  return JSON.parse(raw);
-}
-
-async function getChangedFiles(octokit, owner, repo, pull_number) {
-  return await octokit.paginate(octokit.pulls.listFiles, {
-    owner,
-    repo,
-    pull_number,
-    per_page: 100,
-  });
-}
-
-function detectModules(changedFiles) {
-  const modules = new Set();
-  changedFiles.forEach(({ filename }) => {
-    const [maybeModule] = filename.split("/");
-    if (/^[0-9]{2}-[\w-]+$/.test(maybeModule)) {
-      modules.add(maybeModule);
+// --- Utils ---
+class Utils {
+  static cleanModelJson(raw) {
+    if (!raw) return "";
+    // Remove markdown code fences
+    const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(raw);
+    const content = fenced ? fenced[1].trim() : raw.trim();
+    
+    // Extract JSON object if surrounded by text
+    const firstBrace = content.indexOf("{");
+    const lastBrace = content.lastIndexOf("}");
+    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+      return content.slice(firstBrace, lastBrace + 1);
     }
-  });
-  return [...modules];
-}
-
-function detectTasks(changedFiles) {
-  const tasks = new Set();
-  changedFiles.forEach(({ filename }) => {
-    const [module, task] = filename.split("/");
-    if (module && task && /^[0-9]{2}-[\w-]+$/.test(module)) {
-      tasks.add(`${module}/${task}`);
-    }
-  });
-  return [...tasks];
-}
-
-async function loadModuleSections() {
-  const currentDir = path.dirname(fileURLToPath(import.meta.url));
-  const modulesPath = path.resolve(currentDir, "../instructions/modules.md");
-  const content = await fs.readFile(modulesPath, "utf8");
-  const sections = {};
-  let match;
-  while ((match = MODULE_SECTION_PATTERN.exec(content)) !== null) {
-    const [, moduleId] = match;
-    sections[moduleId] = match[0].trim();
-  }
-  return sections;
-}
-
-function parsePatchLineNumbers(patch) {
-  if (!patch) return new Set();
-  const lines = patch.split("\n");
-  const included = new Set();
-  let newLine = 0;
-
-  for (const line of lines) {
-    if (line.startsWith("@@")) {
-      const headerMatch = /@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(line);
-      if (headerMatch) {
-        newLine = Number(headerMatch[1]);
-      }
-      continue;
-    }
-
-    if (line.startsWith("+") || line.startsWith(" ")) {
-      included.add(newLine);
-      newLine += 1;
-    } else if (line.startsWith("-")) {
-      // deletion: advance only old counter, not new
-      continue;
-    }
+    return content;
   }
 
-  return included;
-}
-
-function addContextLines(lineNumbers, totalLines) {
-  const withContext = new Set();
-  for (const line of lineNumbers) {
-    for (let delta = -CONTEXT_PADDING; delta <= CONTEXT_PADDING; delta += 1) {
-      const candidate = line + delta;
-      if (candidate >= 1 && candidate <= totalLines) {
-        withContext.add(candidate);
+  static safeParseJson(raw) {
+    const cleaned = Utils.cleanModelJson(raw);
+    try {
+      return JSON.parse(cleaned);
+    } catch (err) {
+      try {
+        // Attempt to repair broken JSON from LLM
+        return JSON.parse(jsonrepair(cleaned));
+      } catch (err2) {
+        throw new Error(`Failed to parse AI response: ${err2.message}`);
       }
     }
   }
-  return withContext;
+
+  /**
+   * Converts the AI response into a Markdown string if structured parsing fails.
+   */
+  static formatFallbackMarkdown(conclusion, general, comments) {
+    const lines = [`**Review Result:** ${conclusion}`];
+    if (general) lines.push(`\n**Overview:** ${general}`);
+    if (comments.length) {
+      lines.push("\n**Inline Comments:**");
+      comments.forEach(c => lines.push(`- ${c.filepath}:${c.start_line} ${c.comment}`));
+    }
+    return lines.join("\n");
+  }
 }
 
-async function fetchFileContent(octokit, owner, repo, ref, filePath) {
-  const { data } = await octokit.repos.getContent({
-    owner,
-    repo,
-    path: filePath,
-    ref,
-  });
+// --- Diff & File Processing ---
+class FileManager {
+  static parsePatchLineNumbers(patch) {
+    if (!patch) return new Set();
+    const lines = patch.split("\n");
+    const included = new Set();
+    let newLine = 0;
 
-  if (!("content" in data)) {
-    throw new Error(`Unable to read content for ${filePath}`);
+    for (const line of lines) {
+      if (line.startsWith("@@")) {
+        const match = /@@ -\d+(?:,\d+)? \+(\d+)/.exec(line);
+        if (match) newLine = Number(match[1]);
+        continue;
+      }
+      if (line.startsWith("+") || line.startsWith(" ")) {
+        included.add(newLine);
+        newLine++;
+      }
+    }
+    return included;
   }
 
-  const buff = Buffer.from(data.content, "base64");
-  return buff.toString("utf8");
+  static async buildSnippets(octokit, owner, repo, ref, changedFiles, contentsMap) {
+    const snippets = [];
+    
+    for (const file of changedFiles) {
+      if (!file.patch || file.status === "removed") continue;
+
+      const validLines = FileManager.parsePatchLineNumbers(file.patch);
+      if (validLines.size === 0) continue;
+
+      // Get full content to provide context
+      let lines = contentsMap.get(file.filename);
+      if (!lines) {
+        // Fallback fetch if not in map
+        const raw = await GitHubService.fetchFileContent(octokit, owner, repo, ref, file.filename);
+        lines = raw.split("\n");
+      }
+
+      // Add context padding
+      const linesWithContext = new Set();
+      for (const line of validLines) {
+        for (let i = -CONFIG.CONTEXT_PADDING; i <= CONFIG.CONTEXT_PADDING; i++) {
+          const candidate = line + i;
+          if (candidate >= 1 && candidate <= lines.length) linesWithContext.add(candidate);
+        }
+      }
+
+      const sortedLines = Array.from(linesWithContext)
+        .sort((a, b) => a - b)
+        .slice(0, CONFIG.MAX_LINES_PER_FILE);
+
+      const codeBlock = sortedLines
+        .map(num => `${num}: ${lines[num - 1] || ""}`)
+        .join("\n");
+
+      snippets.push(`File: ${file.filename}\n${codeBlock}`);
+    }
+
+    return snippets.join("\n\n") || "No parseable changes found.";
+  }
 }
 
-async function fetchChangedFileContents(octokit, owner, repo, ref, changedFiles) {
-  const map = new Map();
-
-  for (const file of changedFiles) {
-    if (file.status === "removed") continue;
-    const content = await fetchFileContent(octokit, owner, repo, ref, file.filename);
-    map.set(file.filename, content.split("\n"));
+// --- GitHub Interaction ---
+class GitHubService {
+  constructor(token, context) {
+    this.octokit = new Octokit({ auth: token });
+    this.context = context; // { owner, repo, prNumber, ref, actor }
   }
 
-  return map;
-}
-
-async function buildFileSnippets(octokit, owner, repo, ref, changedFiles, contentsMap) {
-  const snippets = [];
-
-  for (const file of changedFiles) {
-    if (!file.patch) continue;
-
-    const lineNumbers = parsePatchLineNumbers(file.patch);
-    if (lineNumbers.size === 0) continue;
-
-    const lines = contentsMap.get(file.filename)
-      || (await fetchFileContent(octokit, owner, repo, ref, file.filename)).split("\n");
-    const lineNumbersWithContext = addContextLines(lineNumbers, lines.length);
-    const sortedLines = Array.from(lineNumbersWithContext).sort((a, b) => a - b).slice(0, MAX_LINES_PER_FILE);
-
-    const formatted = sortedLines
-      .map((num) => `${num}: ${lines[num - 1] ?? ""}`)
-      .join("\n");
-
-    snippets.push(`File: ${file.filename}\n${formatted}`);
+  static async fetchFileContent(octokit, owner, repo, ref, path) {
+    try {
+      const { data } = await octokit.repos.getContent({ owner, repo, path, ref });
+      return Buffer.from(data.content, "base64").toString("utf8");
+    } catch (e) {
+      console.warn(`Could not read ${path}: ${e.message}`);
+      return "";
+    }
   }
 
-  if (snippets.length === 0) {
-    const fileList = changedFiles.map((f) => f.filename).join(", ");
-    return `Patch data недоступна, изменённые файлы: ${fileList}`;
+  async getChangedFiles() {
+    return await this.octokit.paginate(this.octokit.pulls.listFiles, {
+      owner: this.context.owner,
+      repo: this.context.repo,
+      pull_number: this.context.prNumber,
+      per_page: 100,
+    });
   }
 
-  return snippets.join("\n\n");
-}
+  async fetchAllFileContents(files) {
+    const map = new Map();
+    await Promise.all(
+      files.map(async (file) => {
+        if (file.status === "removed") return;
+        const content = await GitHubService.fetchFileContent(
+          this.octokit, 
+          this.context.owner, 
+          this.context.repo, 
+          this.context.ref, 
+          file.filename
+        );
+        map.set(file.filename, content.split("\n"));
+      })
+    );
+    return map;
+  }
 
-function buildModuleContext(modulesInScope, moduleSections) {
-  return modulesInScope
-    .map((id) => moduleSections[id] || `## ${id}\n(нет конспекта; ориентируйся только на материалы этого модуля)`)
-    .join("\n\n");
-}
+  /**
+   * Post the structured review (General comment + Status + Inline comments)
+   */
+  async submitReview(reviewData, fileContents, changedFiles) {
+    const { conclusion, general_comment, comments } = reviewData;
+    
+    // 1. Determine Event Type
+    let event = conclusion === "REQUEST_CHANGES" ? "REQUEST_CHANGES" : "APPROVE";
+    const isSelfReview = this.context.actor === this.context.prAuthor;
+    
+    // You cannot request changes on your own PR
+    if (isSelfReview) event = "COMMENT"; 
 
-async function loadTaskReadmes(octokit, owner, repo, ref, tasks) {
-  const blocks = [];
+    // 2. Normalize Comments for GitHub API
+    const ghComments = this._normalizeComments(comments, fileContents, changedFiles);
 
-  for (const task of tasks) {
-    const [module, taskName] = task.split("/");
-    const readmePath = `${module}/${taskName}/README.md`;
+    // 3. Fallback logic: If no general comment and no inline comments, do nothing
+    if (!general_comment && ghComments.length === 0) {
+      console.log("Empty review generated. Skipping.");
+      return;
+    }
+
+    console.log(`Submitting review: ${event} with ${ghComments.length} inline comments.`);
 
     try {
-      const content = await fetchFileContent(octokit, owner, repo, ref, readmePath);
-      blocks.push(`### ${module}/${taskName}\n${content}`);
+      await this.octokit.pulls.createReview({
+        owner: this.context.owner,
+        repo: this.context.repo,
+        pull_number: this.context.prNumber,
+        body: general_comment || "Automated Review (No summary provided)",
+        event: event,
+        comments: ghComments,
+      });
+      console.log("Review successfully created.");
     } catch (err) {
-      blocks.push(`### ${module}/${taskName}\nНе удалось загрузить README (${readmePath})`);
+      console.error("Failed to create structured review. Falling back to plain comment.", err.message);
+      // Fallback: Post as a single issue comment if the detailed review fails 
+      // (often due to invalid line numbers in inline comments)
+      const fallbackBody = Utils.formatFallbackMarkdown(conclusion, general_comment, comments);
+      await this.octokit.issues.createComment({
+        owner: this.context.owner,
+        repo: this.context.repo,
+        issue_number: this.context.prNumber,
+        body: fallbackBody
+      });
     }
   }
 
-  return blocks.join("\n\n");
+  _normalizeComments(rawComments, fileContents, changedFiles) {
+    const validPaths = new Set(changedFiles.map(f => f.filename));
+    const results = [];
+
+    for (const c of rawComments) {
+      if (!c.filepath || !validPaths.has(c.filepath)) continue;
+
+      const lines = fileContents.get(c.filepath);
+      const start = Number(c.start_line);
+      
+      // Validation: Line must exist
+      if (!Number.isInteger(start) || start < 1) continue;
+      if (lines && start > lines.length) continue;
+
+      const commentObj = {
+        path: c.filepath,
+        body: c.comment,
+        side: "RIGHT",
+        line: start // GitHub API uses 'line' for the end of the comment
+      };
+
+      // Handle multiline
+      if (c.end_line && Number(c.end_line) > start) {
+        const end = Math.min(Number(c.end_line), lines ? lines.length : Number(c.end_line));
+        commentObj.start_line = start;
+        commentObj.line = end;
+        commentObj.start_side = "RIGHT";
+      }
+
+      results.push(commentObj);
+    }
+    return results;
+  }
 }
 
-function buildPrompt(moduleContext, tasksContext, fileSnippets) {
-  return `### Student GitHub PR Code Review
+// --- Instructions & Prompting ---
+class PromptService {
+  static async loadContext(octokit, context, changedFiles) {
+    // 1. Detect Modules
+    const modules = new Set();
+    changedFiles.forEach(f => {
+      const root = f.filename.split("/")[0];
+      if (CONFIG.MODULE_REGEX.test(root)) modules.add(root);
+    });
+    const moduleList = [...modules];
+
+    // 2. Detect Tasks
+    const tasks = new Set();
+    changedFiles.forEach(f => {
+      const [mod, task] = f.filename.split("/");
+      if (CONFIG.MODULE_REGEX.test(mod) && task) tasks.add(`${mod}/${task}`);
+    });
+
+    if (moduleList.length === 0) return null; // Nothing to review
+
+    // 3. Load Readmes (Tasks)
+    const taskPrompts = [];
+    for (const t of tasks) {
+      const readmePath = `${t}/README.md`;
+      const content = await GitHubService.fetchFileContent(octokit, context.owner, context.repo, context.ref, readmePath);
+      if (content) taskPrompts.push(`### Task: ${t}\n${content}`);
+    }
+
+    // 4. Load Module Instructions (Local file)
+    let moduleInstructions = "";
+    try {
+      const currentDir = path.dirname(fileURLToPath(import.meta.url));
+      const instructionsPath = path.resolve(currentDir, "../instructions/modules.md");
+      const fileContent = await fs.readFile(instructionsPath, "utf8");
+      
+      const sections = {};
+      let match;
+      while ((match = CONFIG.MODULE_SECTION_PATTERN.exec(fileContent)) !== null) {
+        sections[match[1]] = match[0].trim();
+      }
+      
+      moduleInstructions = moduleList.map(id => sections[id] || "").join("\n\n");
+    } catch (e) {
+      console.warn("Could not load local module instructions:", e.message);
+    }
+
+    return { moduleInstructions, taskInstructions: taskPrompts.join("\n\n") };
+  }
+
+  static generate(moduleCtx, taskCtx, snippets) {
+    return `### Student GitHub PR Code Review
 
 #### Role
 You are an experienced developer and mentor who reviews Javascript/DOM/CSS assignments submitted by students. Your feedback style should be personal and informal, as though you're reviewing the student's code directly, offering genuine and helpful advice. Keep your comments concise and straightforward, avoiding overly complex language.
@@ -253,15 +368,15 @@ Prefer one-line comments over multiline comments.
 
 #### Module scope
 Используй только материалы текущего модуля. Контекст модулей:
-${moduleContext}
+${moduleCtx}
 
 Упоминай, если встречается решение, выходящее за рамки этих модулей.
 
 #### Описание задач (README)
-${tasksContext}
+${taskCtx}
 
 #### Changed files (with line numbers)
-${fileSnippets}
+${snippets}
 
 #### Response Format
 Your response must strictly follow this JSON structure:
@@ -291,201 +406,64 @@ Conclusion ("conclusion"):
 Remember, your comments are educational tools meant to help students better understand the principles of quality code.
 
 Respond with JSON only.`;
-}
-
-async function callGemini(prompt, apiKey) {
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-  const result = await model.generateContent(prompt);
-  return result.response.text();
-}
-
-async function postComment(octokit, owner, repo, issue_number, body) {
-  await octokit.issues.createComment({ owner, repo, issue_number, body });
-}
-
-function formatMarkdownReview(rawJson) {
-  try {
-    const parsed = safeParseModelJson(rawJson);
-    const conclusion = parsed.conclusion || "APPROVE";
-    const general = parsed.general_comment || "";
-    const comments = Array.isArray(parsed.comments) ? parsed.comments : [];
-
-    const lines = [];
-    lines.push(`**Итог:** ${conclusion}`);
-    if (general) {
-      lines.push(`**Общее впечатление:** ${general}`);
-    }
-
-    if (comments.length > 0) {
-      lines.push("");
-      lines.push("**Замечания:**");
-      comments.forEach((c) => {
-        const file = c.filepath || "не указан файл";
-        const start = c.start_line ?? "?";
-        const end = c.end_line && c.end_line !== c.start_line ? `-${c.end_line}` : "";
-        const text = c.comment || "";
-        lines.push(`- ${file}:${start}${end} — ${text}`);
-      });
-    }
-
-    return lines.join("\n");
-  } catch (err) {
-    return rawJson;
   }
 }
 
-function parseModelResponse(rawJson) {
-  const parsed = safeParseModelJson(rawJson);
-  const conclusion = parsed.conclusion === "REQUEST_CHANGES" ? "REQUEST_CHANGES" : "APPROVE";
-  const general = typeof parsed.general_comment === "string" ? parsed.general_comment : "";
-  const comments = Array.isArray(parsed.comments) ? parsed.comments : [];
-  return { conclusion, general, comments };
-}
-
-function cleanModelJson(raw) {
-  if (!raw) throw new Error("Empty model response");
-
-  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(raw);
-  if (fenced && fenced[1]) {
-    return fenced[1].trim();
-  }
-
-  const firstBrace = raw.indexOf("{");
-  const lastBrace = raw.lastIndexOf("}");
-  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-    return raw.slice(firstBrace, lastBrace + 1);
-  }
-
-  return raw.trim();
-}
-
-function safeParseModelJson(raw) {
-  const cleaned = cleanModelJson(raw);
-  try {
-    return JSON.parse(cleaned);
-  } catch (err) {
-    try {
-      const repaired = jsonrepair(cleaned);
-      return JSON.parse(repaired);
-    } catch (err2) {
-      throw err2;
-    }
-  }
-}
-
-function normalizeReviewComments(modelComments, fileContents, changedFiles) {
-  const changedSet = new Set(changedFiles.map((f) => f.filename));
-  const results = [];
-
-  for (const c of modelComments) {
-    if (!c || !c.filepath || !changedSet.has(c.filepath)) continue;
-    const lines = fileContents.get(c.filepath);
-    if (!lines) continue;
-
-    const start = Number(c.start_line);
-    const end = c.end_line !== undefined ? Number(c.end_line) : start;
-    if (!Number.isInteger(start) || start < 1) continue;
-    const safeEnd = Number.isInteger(end) && end >= start ? end : start;
-    const maxLine = lines.length;
-    if (start > maxLine) continue;
-
-    const commentObj = {
-      path: c.filepath,
-      body: c.comment || "",
-      side: "RIGHT",
-      line: Math.min(safeEnd, maxLine),
-    };
-
-    if (safeEnd !== start && safeEnd <= maxLine) {
-      commentObj.start_line = start;
-      commentObj.start_side = "RIGHT";
-    }
-
-    results.push(commentObj);
-  }
-
-  return results;
-}
-
+// --- Main Workflow ---
 async function main() {
-  const githubToken = process.env.GITHUB_TOKEN;
-  if (!githubToken) throw new Error("GITHUB_TOKEN is required");
-
+  // 1. Environment Setup
+  const token = process.env.GITHUB_TOKEN;
   const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
-  if (!geminiKey) throw new Error("GEMINI_API_KEY or GOOGLE_API_KEY is required");
+  if (!token || !geminiKey) throw new Error("Missing secrets (GITHUB_TOKEN or GEMINI_API_KEY)");
 
-  const payload = await getEventPayload();
+  // 2. Event Payload Parsing
+  const eventPath = process.env.GITHUB_EVENT_PATH;
+  const payload = JSON.parse(await fs.readFile(eventPath, "utf8"));
   const pr = payload.pull_request;
-  if (!pr) throw new Error("This workflow only supports pull_request events");
-  const prAuthor = pr.user?.login;
-  const actor = process.env.GITHUB_ACTOR;
+  if (!pr) throw new Error("Not a pull_request event");
 
-  const repoString = process.env.GITHUB_REPOSITORY;
-  if (!repoString || !repoString.includes("/")) throw new Error("GITHUB_REPOSITORY is not set");
-  const [owner, repo] = repoString.split("/");
+  const [owner, repo] = process.env.GITHUB_REPOSITORY.split("/");
+  const context = {
+    owner,
+    repo,
+    prNumber: pr.number,
+    ref: pr.head.sha,
+    actor: process.env.GITHUB_ACTOR,
+    prAuthor: pr.user.login
+  };
 
-  const octokit = new Octokit({ auth: githubToken });
+  const gh = new GitHubService(token, context);
 
-  const changedFiles = await getChangedFiles(octokit, owner, repo, pr.number);
-  const modulesInScope = detectModules(changedFiles);
-  const tasksInScope = detectTasks(changedFiles);
-
-  if (modulesInScope.length === 0) {
-    console.log("No coursework modules detected in changed files; skipping AI review.");
+  // 3. Data Gathering
+  console.log(`Starting review for PR #${pr.number}`);
+  const changedFiles = await gh.getChangedFiles();
+  
+  // 4. Context Loading
+  const ctxData = await PromptService.loadContext(gh.octokit, context, changedFiles);
+  if (!ctxData) {
+    console.log("No relevant coursework files detected. Skipping.");
     return;
   }
 
-  const moduleSections = await loadModuleSections();
-  const moduleContext = buildModuleContext(modulesInScope, moduleSections);
-  const fileContents = await fetchChangedFileContents(octokit, owner, repo, pr.head.sha, changedFiles);
-  const fileSnippets = await buildFileSnippets(octokit, owner, repo, pr.head.sha, changedFiles, fileContents);
-  const tasksContext = tasksInScope.length
-    ? await loadTaskReadmes(octokit, owner, repo, pr.head.sha, tasksInScope)
-    : "Задачи не определены по изменённым файлам.";
+  const fileContents = await gh.fetchAllFileContents(changedFiles);
+  const snippets = await FileManager.buildSnippets(gh.octokit, owner, repo, context.ref, changedFiles, fileContents);
 
-  const prompt = buildPrompt(moduleContext, tasksContext, fileSnippets);
+  // 5. AI Execution
+  const prompt = PromptService.generate(ctxData.moduleInstructions, ctxData.taskInstructions, snippets);
+  
+  console.log("Sending prompt to Gemini...");
+  const genAI = new GoogleGenerativeAI(geminiKey);
+  const model = genAI.getGenerativeModel({ model: CONFIG.MODEL_NAME });
+  
+  const result = await model.generateContent(prompt);
+  const responseText = result.response.text();
 
-  console.log(`Modules detected: ${modulesInScope.join(", ")}`);
-
-  const reviewJson = await callGemini(prompt, geminiKey);
-  if (!reviewJson || reviewJson.trim().length === 0) {
-    await postComment(octokit, owner, repo, pr.number, "Gemini did not return a review. Please rerun the workflow.");
-    console.log("Posted fallback review comment");
-    return;
-  }
-
-  try {
-    const parsed = parseModelResponse(reviewJson);
-    const reviewComments = normalizeReviewComments(parsed.comments, fileContents, changedFiles);
-    const event = parsed.conclusion === "REQUEST_CHANGES" ? "REQUEST_CHANGES" : "APPROVE";
-    const selfReview = actor && prAuthor && actor === prAuthor;
-    const finalEvent = selfReview ? "COMMENT" : event;
-
-    if (!parsed.general && reviewComments.length === 0) {
-      console.log("No general comment or inline comments to post.");
-      return;
-    }
-
-    await octokit.pulls.createReview({
-      owner,
-      repo,
-      pull_number: pr.number,
-      body: parsed.general,
-      event: finalEvent,
-      comments: reviewComments,
-    });
-
-    console.log(`Posted PR review with event: ${finalEvent}${selfReview ? " (self-review fallback)" : ""}`);
-  } catch (err) {
-    console.warn("Failed to parse structured review, posting raw markdown. Error:", err.message);
-    const formatted = formatMarkdownReview(reviewJson);
-    await postComment(octokit, owner, repo, pr.number, formatted);
-    console.log("Posted fallback markdown comment");
-  }
+  // 6. Response Parsing & Submission
+  const reviewData = Utils.safeParseJson(responseText);
+  await gh.submitReview(reviewData, fileContents, changedFiles);
 }
 
-main().catch((error) => {
-  console.error("Reviewer failed", error);
+main().catch(err => {
+  console.error("Workflow Failed:", err);
   process.exit(1);
 });
